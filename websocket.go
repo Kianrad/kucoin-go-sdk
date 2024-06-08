@@ -157,6 +157,8 @@ type WebSocketClient struct {
 
 var defaultTimeout = time.Second * 5
 
+var once sync.Once
+
 // WebSocketClientOpts defines the options for the client
 // during the websocket connection.
 type WebSocketClientOpts struct {
@@ -248,9 +250,11 @@ func (wc *WebSocketClient) Connect() (<-chan *WebSocketDownstreamMessage, <-chan
 
 func (wc *WebSocketClient) read() {
 	defer func() {
-		close(wc.pongs)
-		close(wc.messages)
-		wc.wg.Done()
+		once.Do(func() {
+			close(wc.pongs)
+			close(wc.messages)
+			wc.wg.Done()
+		})
 	}()
 
 	for {
