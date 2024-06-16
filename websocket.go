@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,6 +149,7 @@ type WebSocketClient struct {
 	errors chan error
 	// Downstream message channel
 	messages      chan *WebSocketDownstreamMessage
+	rawmessages   chan []byte
 	conn          *websocket.Conn
 	token         *WebSocketTokenModel
 	server        *WebSocketServerModel
@@ -186,6 +188,7 @@ func (as *ApiService) NewWebSocketClientOpts(opts WebSocketClientOpts) *WebSocke
 		acks:          make(chan string, 1),
 		token:         opts.Token,
 		messages:      make(chan *WebSocketDownstreamMessage, 2048),
+		rawmessages:   make(chan []byte, 2048),
 		skipVerifyTls: opts.TLSSkipVerify,
 		timeout:       opts.Timeout,
 	}
@@ -248,6 +251,71 @@ func (wc *WebSocketClient) Connect() (<-chan *WebSocketDownstreamMessage, <-chan
 	return wc.messages, wc.errors, nil
 }
 
+// Connect connects the WebSocket server.
+func (wc *WebSocketClient) RawConnect() (<-chan []byte, <-chan error, error) {
+	// Find out a server
+	s, err := wc.token.Servers.RandomServer()
+	if err != nil {
+		return nil, wc.errors, err
+	}
+	wc.server = s
+
+	// Concat ws url
+	q := url.Values{}
+	q.Add("connectId", IntToString(time.Now().UnixNano()))
+	q.Add("token", wc.token.Token)
+	if wc.token.AcceptUserMessage == true {
+		q.Add("acceptUserMessage", "true")
+	}
+	u := fmt.Sprintf("%s?%s", s.Endpoint, q.Encode())
+
+	// Ignore verify tls
+	dialer := &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 45 * time.Second,
+	}
+	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: wc.skipVerifyTls}
+
+	// Connect ws server
+	dialer.ReadBufferSize = 2048000 //2000 kb
+	wc.conn, _, err = dialer.Dial(u, nil)
+	if err != nil {
+		return nil, wc.errors, err
+	}
+
+	// Must read the first welcome message
+	for {
+		msgType, m, err := wc.conn.ReadMessage()
+
+		mstring := string(m)
+
+		if strings.Contains(mstring, "topic") {
+			msgType = 4
+		} else if strings.Contains(mstring, "ack") {
+			msgType = 2
+		}
+
+		if err != nil {
+			return wc.rawmessages, wc.errors, err
+		}
+		if DebugMode {
+			logrus.Debugf("Received a WebSocket message: %s", ToJsonString(m))
+		}
+		if msgType == 0 {
+			return wc.rawmessages, wc.errors, errors.Errorf("Error message: %s", ToJsonString(m))
+		}
+		if msgType == 1 {
+			break
+		}
+	}
+
+	wc.wg.Add(2)
+	go wc.keepHeartbeat()
+	go wc.readraw()
+
+	return wc.rawmessages, wc.errors, nil
+}
+
 func (wc *WebSocketClient) read() {
 	defer func() {
 		once.Do(func() {
@@ -297,6 +365,77 @@ func (wc *WebSocketClient) read() {
 			default:
 				select {
 				case wc.errors <- errors.Errorf("Unknown message type: %s", m.Type):
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (wc *WebSocketClient) readraw() {
+	defer func() {
+		once.Do(func() {
+			close(wc.pongs)
+			close(wc.rawmessages)
+			wc.wg.Done()
+		})
+	}()
+
+	for {
+		select {
+		case <-wc.done:
+			return
+		default:
+			msgType := 0
+			msgType, m, err := wc.conn.ReadMessage()
+			if err != nil {
+				wc.errors <- err
+			}
+			if DebugMode {
+				logrus.Debugf("Received a WebSocket message: %s", ToJsonString(m))
+			}
+			mstring := string(m)
+			ack := ""
+			pong := ""
+			if strings.Contains(mstring, "topic") {
+				msgType = 4
+			} else if strings.Contains(mstring, "ack") {
+				e := strings.Index(mstring, "\",\"type\":\"ack\"}")
+				ack = mstring[7:e]
+				msgType = 2
+			} else if strings.Contains(mstring, "pong") {
+				e := strings.Index(mstring, "\",\"type\":\"pong\"}")
+				pong = mstring[7:e]
+				msgType = 1
+			}
+
+			// log.Printf("ReadJSON: %s", ToJsonString(m))
+			switch msgType {
+			case 0:
+			case 1:
+				select {
+				case wc.pongs <- pong:
+				default:
+				}
+			case 2:
+				select {
+				case wc.acks <- ack:
+				default:
+				}
+			case 3:
+				select {
+				case wc.errors <- errors.Errorf("Error message: %s", ToJsonString(m)):
+				default:
+				}
+				return
+			case 4:
+				select {
+				case wc.rawmessages <- m:
+				default:
+				}
+			default:
+				select {
+				case wc.errors <- errors.Errorf("Unknown message type: %d", msgType):
 				default:
 				}
 			}
